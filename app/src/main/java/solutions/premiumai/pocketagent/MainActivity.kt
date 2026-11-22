@@ -27,6 +27,7 @@ import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.verticalScroll
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.text.KeyboardOptions
@@ -91,7 +92,7 @@ class MainActivity : ComponentActivity() {
 
 @Composable
 private fun App(vm: AppViewModel = viewModel()) {
-    BackHandler(enabled = vm.screen == Screen.Chat || vm.screen == Screen.Diff) { vm.back() }
+    BackHandler(enabled = vm.screen != Screen.Connect && vm.screen != Screen.Sessions) { vm.back() }
 
     Column(modifier = Modifier.fillMaxSize().safeDrawingPadding()) {
         vm.error?.let { message ->
@@ -105,9 +106,21 @@ private fun App(vm: AppViewModel = viewModel()) {
                     .padding(12.dp),
             )
         }
+        vm.notice?.let { message ->
+            Text(
+                text = message,
+                color = Color(0xFF06240F),
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .background(Added)
+                    .clickable { vm.notice = null }
+                    .padding(12.dp),
+            )
+        }
         when (vm.screen) {
             Screen.Connect -> ConnectScreen(vm)
             Screen.Sessions -> SessionsScreen(vm)
+            Screen.Settings -> SettingsScreen(vm)
             Screen.Chat -> ChatScreen(vm)
             Screen.Diff -> DiffScreen(vm)
         }
@@ -195,7 +208,7 @@ private fun SessionsScreen(vm: AppViewModel) {
                 .background(if (vm.online) Added else Removed),
         )
         Spacer(Modifier.width(8.dp))
-        TextButton(onClick = { vm.disconnect() }) { Text("Disconnect") }
+        TextButton(onClick = { vm.openSettings() }) { Text("Settings") }
         Button(onClick = { choosing = true }) { Text("New") }
     }
 
@@ -251,13 +264,27 @@ private fun PickerDialog(
     options: List<Pair<String, String>>,
     onPick: (String) -> Unit,
     onDismiss: () -> Unit,
+    searchable: Boolean = false,
 ) {
+    var search by remember { mutableStateOf("") }
+    val shown = if (search.isBlank()) options else options.filter { it.first.contains(search.trim(), ignoreCase = true) }
     AlertDialog(
         onDismissRequest = onDismiss,
         title = { Text(title) },
         text = {
+          Column {
+            if (searchable) {
+                OutlinedTextField(
+                    value = search,
+                    onValueChange = { search = it },
+                    placeholder = { Text("Search") },
+                    singleLine = true,
+                    modifier = Modifier.fillMaxWidth(),
+                )
+                Spacer(Modifier.height(8.dp))
+            }
             LazyColumn(modifier = Modifier.heightIn(max = 360.dp)) {
-                items(options) { (label, value) ->
+                items(shown) { (label, value) ->
                     Column(
                         modifier = Modifier.fillMaxWidth().clickable { onPick(value) }.padding(vertical = 10.dp),
                     ) {
@@ -274,6 +301,7 @@ private fun PickerDialog(
                     }
                 }
             }
+          }
         },
         confirmButton = {},
         dismissButton = { TextButton(onClick = onDismiss) { Text("Cancel") } },
@@ -350,14 +378,12 @@ private fun ColumnScope.ChatScreen(vm: AppViewModel) {
     }
 
     if (pickingModel) {
-        PickerDialog(
+        ModelPicker(
             title = "Model for this session",
-            options = vm.models.map { "${it.name}  (${it.providerId})" to "${it.providerId}\n${it.id}" },
-            onPick = { value ->
+            models = vm.models,
+            onPick = { model ->
                 pickingModel = false
-                val providerId = value.substringBefore('\n')
-                val modelId = value.substringAfter('\n')
-                vm.models.firstOrNull { it.id == modelId && it.providerId == providerId }?.let(vm::pickModel)
+                vm.pickModel(model)
             },
             onDismiss = { pickingModel = false },
         )
@@ -507,5 +533,158 @@ private fun DiffScreen(vm: AppViewModel) {
                 }
             }
         }
+    }
+}
+
+@Composable
+private fun ModelPicker(title: String, models: List<ModelItem>, onPick: (ModelItem) -> Unit, onDismiss: () -> Unit) {
+    PickerDialog(
+        title = title,
+        options = models.map { it.label to "${it.providerId}\n${it.id}" },
+        onPick = { value ->
+            val providerId = value.substringBefore('\n')
+            val modelId = value.substringAfter('\n')
+            models.firstOrNull { it.id == modelId && it.providerId == providerId }?.let(onPick)
+        },
+        onDismiss = onDismiss,
+        searchable = true,
+    )
+}
+
+@Composable
+private fun SectionTitle(text: String) {
+    Text(
+        text = text,
+        style = MaterialTheme.typography.labelLarge,
+        color = Accent,
+        modifier = Modifier.padding(top = 20.dp, bottom = 8.dp),
+    )
+}
+
+@Composable
+private fun SettingsScreen(vm: AppViewModel) {
+    var pickingModel by remember { mutableStateOf(false) }
+    var pickingProvider by remember { mutableStateOf(false) }
+    var extraProviderId by rememberSaveable { mutableStateOf("") }
+
+    // Venice and Gemini are pinned; any other provider the server offers can be added below.
+    val venice = vm.providers.firstOrNull { it.id.contains("venice", ignoreCase = true) }
+    val gemini = vm.providers.firstOrNull { it.id == "google" || it.id.contains("gemini", ignoreCase = true) }
+        ?: vm.providers.firstOrNull {
+            it.name.contains("google", ignoreCase = true) && !it.name.contains("vertex", ignoreCase = true)
+        }
+    val extra = vm.providers.firstOrNull { it.id == extraProviderId }
+
+    Header(title = "Settings", onBack = { vm.back() })
+
+    Column(modifier = Modifier.fillMaxSize().verticalScroll(rememberScrollState()).padding(horizontal = 16.dp)) {
+        SectionTitle("API keys")
+        Text(
+            "Keys are sent to your PC's agent server and stored there, not in this app.",
+            style = MaterialTheme.typography.bodySmall,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+        )
+        Spacer(Modifier.height(12.dp))
+        KeyRow(vm, "Venice AI", venice)
+        Spacer(Modifier.height(16.dp))
+        KeyRow(vm, "Google Gemini", gemini)
+        if (extra != null && extra != venice && extra != gemini) {
+            Spacer(Modifier.height(16.dp))
+            KeyRow(vm, extra.name, extra)
+        }
+        TextButton(onClick = { pickingProvider = true }) { Text("Add another provider") }
+
+        SectionTitle("Default model for new sessions")
+        Text(vm.defaultModel?.label ?: "Server default")
+        Row {
+            TextButton(onClick = { pickingModel = true }) { Text("Choose model") }
+            if (vm.defaultModel != null) {
+                TextButton(onClick = { vm.chooseDefaultModel(null) }) { Text("Use server default") }
+            }
+        }
+        Text(
+            "Models marked chat only cannot edit files. Pick one without that mark for coding. " +
+                "You can also switch model inside any session.",
+            style = MaterialTheme.typography.bodySmall,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+        )
+
+        SectionTitle("Server")
+        Text(vm.serverUrl)
+        if (vm.serverVersion.isNotBlank()) {
+            Text(
+                "OpenCode ${vm.serverVersion}",
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
+        }
+        Spacer(Modifier.height(8.dp))
+        OutlinedButton(onClick = { vm.disconnect() }) { Text("Disconnect") }
+        Spacer(Modifier.height(24.dp))
+    }
+
+    if (pickingModel) {
+        ModelPicker(
+            title = "Default model",
+            models = vm.models,
+            onPick = { model ->
+                pickingModel = false
+                vm.chooseDefaultModel(model)
+            },
+            onDismiss = { pickingModel = false },
+        )
+    }
+
+    if (pickingProvider) {
+        PickerDialog(
+            title = "Provider",
+            options = vm.providers.filter { it.acceptsKey }.map { it.name to it.id },
+            onPick = { id ->
+                pickingProvider = false
+                extraProviderId = id
+            },
+            onDismiss = { pickingProvider = false },
+            searchable = true,
+        )
+    }
+}
+
+/** One provider: connection status plus a field to paste a new key. */
+@Composable
+private fun KeyRow(vm: AppViewModel, title: String, provider: ProviderItem?) {
+    var key by remember(provider?.id) { mutableStateOf("") }
+
+    Row(verticalAlignment = Alignment.CenterVertically) {
+        Text(title, fontWeight = FontWeight.SemiBold, modifier = Modifier.weight(1f))
+        Text(
+            text = when {
+                provider == null -> "Not offered by this server"
+                provider.connected -> "Connected"
+                else -> "No key yet"
+            },
+            style = MaterialTheme.typography.bodySmall,
+            color = if (provider?.connected == true) Added else MaterialTheme.colorScheme.onSurfaceVariant,
+        )
+    }
+    if (provider == null) return
+    Spacer(Modifier.height(6.dp))
+    Row(verticalAlignment = Alignment.CenterVertically) {
+        OutlinedTextField(
+            value = key,
+            onValueChange = { key = it },
+            placeholder = { Text(if (provider.connected) "Paste a new key to replace" else "Paste API key") },
+            singleLine = true,
+            visualTransformation = PasswordVisualTransformation(),
+            keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Password),
+            modifier = Modifier.weight(1f),
+        )
+        Spacer(Modifier.width(8.dp))
+        Button(
+            onClick = {
+                vm.saveKey(provider, key)
+                key = ""
+            },
+            enabled = key.isNotBlank(),
+        ) { Text("Save") }
     }
 }

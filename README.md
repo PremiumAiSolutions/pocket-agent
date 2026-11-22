@@ -16,6 +16,7 @@ the phone client plus setup scripts.
 - Approve or reject permission requests (once, always, reject)
 - Stop a running task
 - Switch the model per session (Venice, Gemini, anything the server has configured)
+- Settings: paste API keys for Venice, Gemini or any other provider, and pick the default model
 - View the file changes a session made
 
 ## Run the server on your PC

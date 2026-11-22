@@ -14,13 +14,18 @@ import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import kotlinx.serialization.json.JsonObject
 
-enum class Screen { Connect, Sessions, Chat, Diff }
+enum class Screen { Connect, Sessions, Settings, Chat, Diff }
 
 data class SessionItem(val id: String, val title: String, val directory: String)
 
 data class ProjectItem(val name: String, val directory: String)
 
-data class ModelItem(val id: String, val providerId: String, val name: String)
+/** tools is false for models that cannot call tools, which the agent needs to edit files. */
+data class ModelItem(val id: String, val providerId: String, val name: String, val tools: Boolean = true) {
+    val label: String get() = if (tools) "$name  ($providerId)" else "$name  ($providerId, chat only)"
+}
+
+data class ProviderItem(val id: String, val name: String, val connected: Boolean, val acceptsKey: Boolean)
 
 sealed interface Block {
     data class Text(val ordinal: Int, val text: String) : Block
@@ -63,6 +68,17 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
     var projects by mutableStateOf(listOf<ProjectItem>())
         private set
     var models by mutableStateOf(listOf<ModelItem>())
+        private set
+    var providers by mutableStateOf(listOf<ProviderItem>())
+        private set
+    var notice by mutableStateOf<String?>(null)
+
+    /** Model used for new sessions, chosen in Settings. Null means the server decides. */
+    var defaultModel by mutableStateOf(
+        prefs.getString("model_id", null)?.let { id ->
+            ModelItem(id, prefs.getString("model_provider", "") ?: "", prefs.getString("model_name", id) ?: id)
+        },
+    )
         private set
 
     var current by mutableStateOf<SessionItem?>(null)
@@ -137,13 +153,62 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
             val directory = project.s("canonical") ?: return@mapNotNull null
             ProjectItem(project.s("name") ?: directory.substringAfterLast('/').substringAfterLast('\\'), directory)
         }
+        loadModels(client)
+        loadProviders(client)
+    }
+
+    private suspend fun loadModels(client: OpenCodeApi) {
         models = client.models().mapNotNull { it.obj() }
             .filter { it["enabled"].str() != "false" }
             .mapNotNull { model ->
                 val id = model.s("id") ?: return@mapNotNull null
                 val provider = model.s("providerID") ?: return@mapNotNull null
-                ModelItem(id, provider, model.s("name") ?: id)
+                val tools = model.o("capabilities")?.get("tools").str() != "false"
+                ModelItem(id, provider, model.s("name") ?: id, tools)
             }
+            .sortedWith(compareBy({ it.providerId }, { it.name.lowercase() }))
+    }
+
+    private suspend fun loadProviders(client: OpenCodeApi) {
+        providers = client.integrations().mapNotNull { it.obj() }.mapNotNull { integration ->
+            val id = integration.s("id") ?: return@mapNotNull null
+            ProviderItem(
+                id = id,
+                name = integration.s("name") ?: id,
+                connected = integration.a("connections").isNotEmpty(),
+                acceptsKey = integration.a("methods").any { it.obj().s("type") == "key" },
+            )
+        }.sortedBy { it.name.lowercase() }
+    }
+
+    fun openSettings() {
+        screen = Screen.Settings
+        refreshHome()
+    }
+
+    /** Sends an API key to the server, which stores it and unlocks that provider's models. */
+    fun saveKey(provider: ProviderItem, key: String) {
+        val trimmed = key.trim()
+        if (trimmed.isEmpty()) return
+        run { client ->
+            client.connectKey(provider.id, trimmed)
+            notice = "${provider.name} key saved"
+            loadProviders(client)
+            // The server refreshes its model list shortly after a key is added.
+            delay(1500)
+            loadModels(client)
+        }
+    }
+
+    fun chooseDefaultModel(model: ModelItem?) {
+        defaultModel = model
+        prefs.edit().apply {
+            if (model == null) {
+                remove("model_id").remove("model_provider").remove("model_name")
+            } else {
+                putString("model_id", model.id).putString("model_provider", model.providerId).putString("model_name", model.name)
+            }
+        }.apply()
     }
 
     fun refreshHome() = run { loadHome(it) }
@@ -155,7 +220,7 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
     }
 
     fun newSession(directory: String?) = run { client ->
-        val created = client.createSession(directory)?.let(::parseSession) ?: return@run
+        val created = client.createSession(directory, defaultModel)?.let(::parseSession) ?: return@run
         sessions = listOf(created) + sessions
         openSession(created)
     }
@@ -175,6 +240,7 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
     fun back() {
         when (screen) {
             Screen.Diff -> screen = Screen.Chat
+            Screen.Settings -> screen = Screen.Sessions
             Screen.Chat -> {
                 current = null
                 screen = Screen.Sessions

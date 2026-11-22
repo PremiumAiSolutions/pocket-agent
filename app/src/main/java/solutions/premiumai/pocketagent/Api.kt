@@ -95,9 +95,13 @@ class OpenCodeApi(baseUrl: String, password: String) {
     suspend fun sessions(): JsonArray =
         request("GET", "/api/session", mapOf("limit" to "50", "order" to "desc")).obj().a("data")
 
-    suspend fun createSession(directory: String?): JsonObject? {
+    suspend fun createSession(directory: String?, model: ModelItem?): JsonObject? {
         val body = buildJsonObject {
             if (!directory.isNullOrBlank()) putJsonObject("location") { put("directory", directory) }
+            if (model != null) putJsonObject("model") {
+                put("id", model.id)
+                put("providerID", model.providerId)
+            }
         }
         return request("POST", "/api/session", body = body).obj().o("data")
     }
@@ -137,6 +141,14 @@ class OpenCodeApi(baseUrl: String, password: String) {
             }
         }
         request("POST", "/api/session/$sessionId/model", body = body)
+    }
+
+    /** AI providers the server can talk to, with how each one signs in. */
+    suspend fun integrations(): JsonArray = request("GET", "/api/integration").obj().a("data")
+
+    /** Stores an API key for a provider on the server. */
+    suspend fun connectKey(integrationId: String, key: String) {
+        request("POST", "/api/integration/$integrationId/connect/key", body = buildJsonObject { put("key", key) })
     }
 
     suspend fun sessionDiff(sessionId: String): JsonArray =
