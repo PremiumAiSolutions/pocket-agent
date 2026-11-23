@@ -13,6 +13,7 @@ the phone client plus setup scripts.
 - Connect to the server with its address and password
 - List sessions, start a new one in any project the server knows
 - Chat with live streaming text and a row for each tool call
+- Attach screenshots or photos to a message so the model can see what you mean
 - Approve or reject permission requests (once, always, reject)
 - Stop a running task
 - Switch the model per session (Venice, Gemini, anything the server has configured)

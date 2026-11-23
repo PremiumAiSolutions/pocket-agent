@@ -3,6 +3,11 @@ package solutions.premiumai.pocketagent
 import android.app.Application
 import android.content.ContentValues
 import android.content.Context
+import android.graphics.Bitmap
+import android.graphics.BitmapFactory
+import android.net.Uri
+import android.util.Base64
+import java.io.ByteArrayOutputStream
 import android.os.Build
 import android.provider.MediaStore
 import androidx.compose.runtime.getValue
@@ -50,8 +55,13 @@ data class LovableProject(val id: String, val name: String)
 
 data class ProviderItem(val id: String, val name: String, val connected: Boolean, val acceptsKey: Boolean)
 
+/** A picture picked for the next message: the encoded copy to send plus a small preview to show. */
+class Attachment(val name: String, val dataUri: String, val preview: Bitmap)
+
 sealed interface Block {
     data class Text(val ordinal: Int, val text: String) : Block
+    /** key is stable per image so the decoded preview can be cached by the UI. */
+    data class Image(val key: String, val base64: String) : Block
     data class Tool(val id: String, val name: String, val status: String, val detail: String) : Block
 }
 
@@ -606,14 +616,69 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
         }
     }
 
+    /** Pictures waiting to go out with the next message. */
+    var attachments by mutableStateOf(listOf<Attachment>())
+        private set
+
+    /** Reads picked pictures, shrinking them so screenshots stay small enough to send quickly. */
+    fun addImages(uris: List<Uri>) {
+        if (uris.isEmpty()) return
+        task(null) {
+            val added = withContext(Dispatchers.IO) { uris.mapNotNull(::readImage) }
+            if (added.size < uris.size) error = "Some pictures could not be read"
+            attachments = (attachments + added).take(6)
+        }
+    }
+
+    private fun readImage(uri: Uri): Attachment? = runCatching {
+        val resolver = getApplication<Application>().contentResolver
+        val bounds = BitmapFactory.Options().apply { inJustDecodeBounds = true }
+        resolver.openInputStream(uri)?.use { BitmapFactory.decodeStream(it, null, bounds) }
+        // Longest side is capped near 1568px, which is plenty for a model to read UI text.
+        val limit = 1568
+        var sample = 1
+        while (maxOf(bounds.outWidth, bounds.outHeight) / (sample * 2) >= limit) sample *= 2
+        val decoded = resolver.openInputStream(uri)?.use {
+            BitmapFactory.decodeStream(it, null, BitmapFactory.Options().apply { inSampleSize = sample })
+        } ?: return null
+        val longest = maxOf(decoded.width, decoded.height)
+        val full = if (longest > limit) {
+            Bitmap.createScaledBitmap(decoded, decoded.width * limit / longest, decoded.height * limit / longest, true)
+        } else {
+            decoded
+        }
+        val bytes = ByteArrayOutputStream().also { full.compress(Bitmap.CompressFormat.JPEG, 85, it) }.toByteArray()
+        val previewScale = 200f / maxOf(full.width, full.height)
+        val preview = Bitmap.createScaledBitmap(
+            full,
+            (full.width * previewScale).toInt().coerceAtLeast(1),
+            (full.height * previewScale).toInt().coerceAtLeast(1),
+            true,
+        )
+        Attachment(
+            name = "image-${System.nanoTime()}.jpg",
+            dataUri = "data:image/jpeg;base64," + Base64.encodeToString(bytes, Base64.NO_WRAP),
+            preview = preview,
+        )
+    }.getOrNull()
+
+    fun removeAttachment(attachment: Attachment) {
+        attachments = attachments.filterNot { it === attachment }
+    }
+
     fun send(text: String) {
         val session = current ?: return
-        val trimmed = text.trim()
+        val images = attachments
+        val trimmed = text.trim().ifEmpty { if (images.isEmpty()) "" else "See the attached image." }
         if (trimmed.isEmpty()) return
+        attachments = emptyList()
         // Show the message right away; the server copy replaces it on the next refresh.
-        messages = messages + ChatItem("local-${System.nanoTime()}", "user", listOf(Block.Text(0, trimmed)))
+        val localId = "local-${System.nanoTime()}"
+        val blocks = listOf<Block>(Block.Text(0, trimmed)) +
+            images.mapIndexed { index, image -> Block.Image("$localId-$index", image.dataUri.substringAfter("base64,")) }
+        messages = messages + ChatItem(localId, "user", blocks)
         busy = true
-        run { it.prompt(session.id, trimmed) }
+        run { it.prompt(session.id, trimmed, images) }
     }
 
     fun stop() {
@@ -780,7 +845,14 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
     private fun parseMessage(message: JsonObject): ChatItem? {
         val id = message.s("id") ?: return null
         return when (message.s("type")) {
-            "user" -> ChatItem(id, "user", listOf(Block.Text(0, message.s("text") ?: "")))
+            "user" -> {
+                val images = message.a("files").mapIndexedNotNull { index, element ->
+                    val file = element.obj()
+                    val data = file.s("data")
+                    if (data != null && file.s("mime")?.startsWith("image/") == true) Block.Image("$id-$index", data) else null
+                }
+                ChatItem(id, "user", listOf<Block>(Block.Text(0, message.s("text") ?: "")) + images)
+            }
             "assistant" -> {
                 val blocks = message.a("content").mapIndexedNotNull { ordinal, element ->
                     val part = element.obj() ?: return@mapIndexedNotNull null

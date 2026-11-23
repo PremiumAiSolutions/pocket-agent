@@ -15,6 +15,8 @@ import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.JsonPrimitive
 import kotlinx.serialization.json.buildJsonObject
 import kotlinx.serialization.json.put
+import kotlinx.serialization.json.addJsonObject
+import kotlinx.serialization.json.putJsonArray
 import kotlinx.serialization.json.putJsonObject
 import okhttp3.Credentials
 import okhttp3.HttpUrl.Companion.toHttpUrl
@@ -114,8 +116,22 @@ class OpenCodeApi(baseUrl: String, password: String) {
         request("GET", "/api/session/$sessionId/message", mapOf("limit" to "200", "order" to "desc"))
             .obj().a("data").mapNotNull { it.obj() }.reversed()
 
-    suspend fun prompt(sessionId: String, text: String) {
-        request("POST", "/api/session/$sessionId/prompt", body = buildJsonObject { put("text", text) })
+    /** Sends a message. Images travel inline as data URIs, the same way the desktop client attaches them. */
+    suspend fun prompt(sessionId: String, text: String, images: List<Attachment> = emptyList()) {
+        val body = buildJsonObject {
+            put("text", text)
+            if (images.isNotEmpty()) {
+                putJsonArray("files") {
+                    images.forEach { image ->
+                        addJsonObject {
+                            put("uri", image.dataUri)
+                            put("name", image.name)
+                        }
+                    }
+                }
+            }
+        }
+        request("POST", "/api/session/$sessionId/prompt", body = body)
     }
 
     suspend fun interrupt(sessionId: String) {

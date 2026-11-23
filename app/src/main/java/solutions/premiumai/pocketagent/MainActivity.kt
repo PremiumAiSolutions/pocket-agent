@@ -1,8 +1,14 @@
 package solutions.premiumai.pocketagent
 
+import android.graphics.BitmapFactory
 import android.os.Bundle
+import android.util.Base64
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.BackHandler
+import androidx.activity.compose.rememberLauncherForActivityResult
+import androidx.activity.result.PickVisualMediaRequest
+import androidx.activity.result.contract.ActivityResultContracts
+import androidx.compose.foundation.Image
 import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
 import androidx.compose.foundation.background
@@ -54,6 +60,8 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.asImageBitmap
+import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.KeyboardType
@@ -388,12 +396,17 @@ private fun ColumnScope.ChatScreen(vm: AppViewModel) {
     var draft by rememberSaveable { mutableStateOf("") }
     var pickingModel by remember { mutableStateOf(false) }
     val listState = rememberLazyListState()
+    // The system photo picker needs no storage permission.
+    val imagePicker = rememberLauncherForActivityResult(ActivityResultContracts.PickMultipleVisualMedia(6)) { uris ->
+        vm.addImages(uris)
+    }
 
     // Keep the newest text in view while the agent is writing.
     val lastSize = vm.messages.lastOrNull()?.blocks?.fold(0) { total, block ->
         total + when (block) {
             is Block.Text -> block.text.length
             is Block.Tool -> 1
+            is Block.Image -> 1
         }
     } ?: 0
     LaunchedEffect(vm.messages.size, lastSize) {
@@ -427,10 +440,40 @@ private fun ColumnScope.ChatScreen(vm: AppViewModel) {
         }
     }
 
+    if (vm.attachments.isNotEmpty()) {
+        Row(
+            modifier = Modifier.fillMaxWidth().horizontalScroll(rememberScrollState()).padding(horizontal = 8.dp),
+            verticalAlignment = Alignment.CenterVertically,
+        ) {
+            vm.attachments.forEach { attachment ->
+                Image(
+                    bitmap = attachment.preview.asImageBitmap(),
+                    contentDescription = "Attached image, tap to remove",
+                    contentScale = ContentScale.Crop,
+                    modifier = Modifier
+                        .padding(end = 8.dp)
+                        .size(56.dp)
+                        .clip(RoundedCornerShape(8.dp))
+                        .clickable { vm.removeAttachment(attachment) },
+                )
+            }
+            Text(
+                "Tap a picture to remove it",
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
+        }
+    }
+
     Row(
         modifier = Modifier.fillMaxWidth().padding(8.dp),
         verticalAlignment = Alignment.Bottom,
     ) {
+        TextButton(
+            onClick = {
+                imagePicker.launch(PickVisualMediaRequest(ActivityResultContracts.PickVisualMedia.ImageOnly))
+            },
+        ) { Text("+ Image") }
         OutlinedTextField(
             value = draft,
             onValueChange = { draft = it },
@@ -439,7 +482,7 @@ private fun ColumnScope.ChatScreen(vm: AppViewModel) {
             modifier = Modifier.weight(1f),
         )
         Spacer(Modifier.width(8.dp))
-        if (vm.busy && draft.isBlank()) {
+        if (vm.busy && draft.isBlank() && vm.attachments.isEmpty()) {
             OutlinedButton(onClick = { vm.stop() }) { Text("Stop") }
         } else {
             Button(
@@ -447,7 +490,7 @@ private fun ColumnScope.ChatScreen(vm: AppViewModel) {
                     vm.send(draft)
                     draft = ""
                 },
-                enabled = draft.isNotBlank(),
+                enabled = draft.isNotBlank() || vm.attachments.isNotEmpty(),
             ) { Text("Send") }
         }
     }
@@ -494,6 +537,22 @@ private fun MessageView(message: ChatItem) {
                         )
                     }
                     is Block.Tool -> ToolRow(block)
+                    is Block.Image -> {
+                        val picture = remember(block.key) {
+                            runCatching {
+                                val bytes = Base64.decode(block.base64, Base64.DEFAULT)
+                                BitmapFactory.decodeByteArray(bytes, 0, bytes.size, BitmapFactory.Options().apply { inSampleSize = 2 })
+                            }.getOrNull()
+                        }
+                        if (picture != null) {
+                            Image(
+                                bitmap = picture.asImageBitmap(),
+                                contentDescription = "Attached image",
+                                contentScale = ContentScale.Fit,
+                                modifier = Modifier.heightIn(max = 200.dp).clip(RoundedCornerShape(8.dp)),
+                            )
+                        }
+                    }
                 }
             }
         }
