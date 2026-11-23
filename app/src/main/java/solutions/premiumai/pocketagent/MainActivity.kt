@@ -117,9 +117,20 @@ private fun App(vm: AppViewModel = viewModel()) {
                     .padding(12.dp),
             )
         }
+        vm.activity?.let { label ->
+            Row(
+                modifier = Modifier.fillMaxWidth().background(MaterialTheme.colorScheme.surfaceVariant).padding(12.dp),
+                verticalAlignment = Alignment.CenterVertically,
+            ) {
+                CircularProgressIndicator(modifier = Modifier.size(16.dp), strokeWidth = 2.dp)
+                Spacer(Modifier.width(10.dp))
+                Text(label)
+            }
+        }
         when (vm.screen) {
             Screen.Connect -> ConnectScreen(vm)
             Screen.Sessions -> SessionsScreen(vm)
+            Screen.Projects -> ProjectsScreen(vm)
             Screen.Settings -> SettingsScreen(vm)
             Screen.Chat -> ChatScreen(vm)
             Screen.Diff -> DiffScreen(vm)
@@ -198,8 +209,6 @@ private fun ConnectScreen(vm: AppViewModel) {
 
 @Composable
 private fun SessionsScreen(vm: AppViewModel) {
-    var choosing by remember { mutableStateOf(false) }
-
     Header(title = "Sessions") {
         Box(
             modifier = Modifier
@@ -209,7 +218,7 @@ private fun SessionsScreen(vm: AppViewModel) {
         )
         Spacer(Modifier.width(8.dp))
         TextButton(onClick = { vm.openSettings() }) { Text("Settings") }
-        Button(onClick = { choosing = true }) { Text("New") }
+        Button(onClick = { vm.openProjects() }) { Text("New") }
     }
 
     if (vm.sessions.isEmpty()) {
@@ -244,16 +253,80 @@ private fun SessionsScreen(vm: AppViewModel) {
         }
     }
 
-    if (choosing) {
-        PickerDialog(
-            title = "Start a session in",
-            options = listOf("Server's default folder" to "") + vm.projects.map { it.name to it.directory },
-            onPick = { directory ->
-                choosing = false
-                vm.newSession(directory.ifBlank { null })
-            },
-            onDismiss = { choosing = false },
-        )
+}
+
+/** Pick where a new session works: a folder already on the PC, or a GitHub repo to clone there. */
+@Composable
+private fun ProjectsScreen(vm: AppViewModel) {
+    var search by rememberSaveable { mutableStateOf("") }
+    val query = search.trim()
+    val folders = vm.folders.filter { query.isEmpty() || it.name.contains(query, ignoreCase = true) }
+    val repos = vm.repos.filter { query.isEmpty() || it.fullName.contains(query, ignoreCase = true) }
+
+    Header(title = "Start a session", onBack = { vm.back() })
+
+    OutlinedTextField(
+        value = search,
+        onValueChange = { search = it },
+        placeholder = { Text("Search folders and repos") },
+        singleLine = true,
+        modifier = Modifier.fillMaxWidth().padding(horizontal = 12.dp, vertical = 8.dp),
+    )
+
+    LazyColumn(modifier = Modifier.fillMaxSize().padding(horizontal = 16.dp)) {
+        item { SectionTitle("On your PC") }
+        if (vm.baseDir.isNotBlank() && query.isEmpty()) {
+            item {
+                ProjectRow(title = "Whole folder", subtitle = vm.baseDir, trailing = "") { vm.newSession(vm.baseDir) }
+            }
+        }
+        items(folders, key = { "folder:" + it.directory }) { folder ->
+            ProjectRow(title = folder.name, subtitle = folder.directory, trailing = "") { vm.newSession(folder.directory) }
+        }
+
+        item { SectionTitle("GitHub") }
+        item {
+            Text(
+                text = when {
+                    !vm.githubChecked -> "Checking GitHub sign-in on your PC"
+                    vm.githubUser == null -> "GitHub is not signed in on your PC. Run  gh auth login  there, then reopen this screen."
+                    else -> "Signed in as ${vm.githubUser}. Tap a repo to open it; repos not on the PC yet are cloned first."
+                },
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
+        }
+        items(repos, key = { "repo:" + it.fullName }) { repo ->
+            ProjectRow(
+                title = repo.fullName,
+                subtitle = if (repo.private) "Private" else "Public",
+                trailing = if (vm.localFolder(repo) != null) "On PC" else "Clone",
+            ) { vm.openRepo(repo) }
+        }
+        item { Spacer(Modifier.height(24.dp)) }
+    }
+}
+
+@Composable
+private fun ProjectRow(title: String, subtitle: String, trailing: String, onClick: () -> Unit) {
+    Row(
+        modifier = Modifier.fillMaxWidth().clickable(onClick = onClick).padding(vertical = 10.dp),
+        verticalAlignment = Alignment.CenterVertically,
+    ) {
+        Column(modifier = Modifier.weight(1f)) {
+            Text(title, maxLines = 1, overflow = TextOverflow.Ellipsis)
+            Text(
+                subtitle,
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis,
+            )
+        }
+        if (trailing.isNotBlank()) {
+            Spacer(Modifier.width(8.dp))
+            Text(trailing, style = MaterialTheme.typography.labelMedium, color = Accent)
+        }
     }
 }
 
@@ -484,16 +557,64 @@ private fun PermissionDialog(vm: AppViewModel, permission: PermissionItem) {
 
 @Composable
 private fun DiffScreen(vm: AppViewModel) {
+    var message by rememberSaveable { mutableStateOf("") }
+    var pickingLovable by remember { mutableStateOf(false) }
+
     Header(title = "Changes", onBack = { vm.back() })
 
-    if (vm.diff.isEmpty()) {
-        Box(modifier = Modifier.fillMaxSize().padding(24.dp), contentAlignment = Alignment.Center) {
-            Text("No file changes in this session yet.", color = MaterialTheme.colorScheme.onSurfaceVariant)
-        }
-        return
-    }
-
     LazyColumn(modifier = Modifier.fillMaxSize().padding(horizontal = 12.dp)) {
+        item {
+            Column(modifier = Modifier.padding(vertical = 10.dp)) {
+                OutlinedTextField(
+                    value = message,
+                    onValueChange = { message = it },
+                    placeholder = { Text("Commit message") },
+                    maxLines = 3,
+                    modifier = Modifier.fillMaxWidth(),
+                )
+                Spacer(Modifier.height(8.dp))
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    Button(
+                        onClick = {
+                            vm.commitAndPush(message)
+                            message = ""
+                        },
+                        enabled = vm.activity == null,
+                    ) { Text("Commit and push") }
+                    Spacer(Modifier.width(8.dp))
+                    OutlinedButton(
+                        onClick = {
+                            val linked = vm.linkedLovableProject()
+                            if (vm.lovableKey.isBlank()) {
+                                vm.error = "Add your Lovable API key in Settings first"
+                            } else if (linked != null) {
+                                vm.publishLovable(linked)
+                            } else {
+                                vm.loadLovableProjects()
+                                pickingLovable = true
+                            }
+                        },
+                        enabled = vm.activity == null,
+                    ) { Text("Publish on Lovable") }
+                }
+                Text(
+                    text = "Commits every change in this project and pushes to " + (vm.branch ?: "the current branch") + ".",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    modifier = Modifier.padding(top = 6.dp),
+                )
+            }
+            HorizontalDivider(color = MaterialTheme.colorScheme.surfaceVariant)
+        }
+        if (vm.diff.isEmpty()) {
+            item {
+                Text(
+                    "No file changes recorded in this session yet.",
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    modifier = Modifier.padding(vertical = 24.dp),
+                )
+            }
+        }
         items(vm.diff, key = { it.file }) { file ->
             Column(modifier = Modifier.padding(vertical = 10.dp)) {
                 Row(verticalAlignment = Alignment.CenterVertically) {
@@ -534,6 +655,22 @@ private fun DiffScreen(vm: AppViewModel) {
             }
         }
     }
+
+    if (pickingLovable) {
+        PickerDialog(
+            title = "Which Lovable project is this?",
+            options = vm.lovableProjects.map { it.name to it.id },
+            onPick = { id ->
+                pickingLovable = false
+                vm.lovableProjects.firstOrNull { it.id == id }?.let { project ->
+                    vm.linkLovableProject(project)
+                    vm.publishLovable(project.id)
+                }
+            },
+            onDismiss = { pickingLovable = false },
+            searchable = true,
+        )
+    }
 }
 
 @Composable
@@ -566,6 +703,7 @@ private fun SettingsScreen(vm: AppViewModel) {
     var pickingModel by remember { mutableStateOf(false) }
     var pickingProvider by remember { mutableStateOf(false) }
     var extraProviderId by rememberSaveable { mutableStateOf("") }
+    var lovableDraft by remember { mutableStateOf("") }
 
     // Venice and Gemini are pinned; any other provider the server offers can be added below.
     val venice = vm.providers.firstOrNull { it.id.contains("venice", ignoreCase = true) }
@@ -607,6 +745,54 @@ private fun SettingsScreen(vm: AppViewModel) {
                 "You can also switch model inside any session.",
             style = MaterialTheme.typography.bodySmall,
             color = MaterialTheme.colorScheme.onSurfaceVariant,
+        )
+
+        SectionTitle("GitHub")
+        Text(
+            when {
+                !vm.githubChecked -> "Not checked yet"
+                vm.githubUser == null -> "Not signed in on your PC"
+                else -> "Signed in as ${vm.githubUser}  (${vm.repos.size} repos)"
+            },
+        )
+        Text(
+            "The app uses the GitHub sign-in on your PC to list, clone, commit and push, so no token is stored " +
+                "on the phone. If it is not signed in, run  gh auth login  on the PC once.",
+            style = MaterialTheme.typography.bodySmall,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+        )
+        TextButton(onClick = { vm.refreshGithub() }) { Text("Check again") }
+
+        SectionTitle("Lovable")
+        Text(
+            if (vm.lovableKey.isBlank()) "No key yet" else "Key saved  (${vm.lovableProjects.size} projects loaded)",
+        )
+        Spacer(Modifier.height(6.dp))
+        Row(verticalAlignment = Alignment.CenterVertically) {
+            OutlinedTextField(
+                value = lovableDraft,
+                onValueChange = { lovableDraft = it },
+                placeholder = { Text("Paste Lovable API key (lov_...)") },
+                singleLine = true,
+                visualTransformation = PasswordVisualTransformation(),
+                keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Password),
+                modifier = Modifier.weight(1f),
+            )
+            Spacer(Modifier.width(8.dp))
+            Button(
+                onClick = {
+                    vm.saveLovableKey(lovableDraft)
+                    lovableDraft = ""
+                },
+                enabled = lovableDraft.isNotBlank(),
+            ) { Text("Save") }
+        }
+        Text(
+            "Used for the Publish on Lovable button, which publishes without spending AI credits. " +
+                "This key is stored on the phone. Lovable only issues API keys on Business and Enterprise plans.",
+            style = MaterialTheme.typography.bodySmall,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+            modifier = Modifier.padding(top = 6.dp),
         )
 
         SectionTitle("Server")

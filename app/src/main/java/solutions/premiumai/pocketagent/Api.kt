@@ -3,6 +3,7 @@ package solutions.premiumai.pocketagent
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.channels.awaitClose
 import kotlinx.coroutines.flow.Flow
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.callbackFlow
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
@@ -24,6 +25,8 @@ import okhttp3.RequestBody.Companion.toRequestBody
 import java.util.concurrent.TimeUnit
 
 class ApiException(val status: Int, message: String) : Exception(message)
+
+data class ShellResult(val ok: Boolean, val output: String)
 
 // Small helpers for reading loosely typed JSON without crashing on a missing field.
 fun JsonElement?.obj(): JsonObject? = this as? JsonObject
@@ -154,6 +157,44 @@ class OpenCodeApi(baseUrl: String, password: String) {
     suspend fun sessionDiff(sessionId: String): JsonArray =
         request("GET", "/api/session/$sessionId/diff").obj().a("data")
 
+    private fun at(directory: String?): Map<String, String?> = mapOf("location[directory]" to directory)
+
+    /** The folder the server was started in. */
+    suspend fun baseDirectory(): String? = request("GET", "/api/location").obj().s("directory")
+
+    /** Names of the folders directly inside a directory on the PC. */
+    suspend fun folders(directory: String?): List<String> =
+        request("GET", "/api/fs/list", at(directory)).obj().a("data")
+            .mapNotNull { it.obj() }
+            .filter { it.s("type") == "directory" }
+            .mapNotNull { it.s("path")?.trimEnd('/', '\\')?.substringAfterLast('/')?.substringAfterLast('\\') }
+            .filter { it.isNotBlank() }
+
+    suspend fun branch(directory: String?): String? =
+        request("GET", "/api/vcs", at(directory)).obj().o("data").o("branch").s("current")
+
+    /**
+     * Runs one command on the PC and waits for it to finish.
+     * Commands are kept to a single program call so they work in PowerShell, cmd and bash alike.
+     */
+    suspend fun shell(command: String, directory: String?, timeoutSeconds: Int = 180): ShellResult {
+        val body = buildJsonObject {
+            put("command", command)
+            if (!directory.isNullOrBlank()) put("cwd", directory)
+        }
+        var info = request("POST", "/api/shell", at(directory), body).obj().o("data")
+        val id = info.s("id") ?: throw ApiException(0, "The server could not start the command")
+        var polls = 0
+        while (info.s("status") == "running") {
+            if (polls++ >= timeoutSeconds * 2) throw ApiException(0, "Timed out waiting for: $command")
+            delay(500)
+            info = request("GET", "/api/shell/$id", at(directory)).obj().o("data")
+        }
+        val output = request("GET", "/api/shell/$id/output", at(directory)).obj().o("data").s("output") ?: ""
+        val succeeded = info.s("status") == "exited" && info.s("exit")?.toDoubleOrNull() == 0.0
+        return ShellResult(succeeded, output.trim())
+    }
+
     /** Live server events. Each item is one event object: {id, type, data}. */
     fun events(): Flow<JsonObject> = callbackFlow {
         val request = Request.Builder()
@@ -195,4 +236,66 @@ class OpenCodeApi(baseUrl: String, password: String) {
             return if (trimmed.startsWith("http://") || trimmed.startsWith("https://")) trimmed else "http://$trimmed"
         }
     }
+}
+
+/**
+ * Client for the Lovable public API. It lists projects and publishes them;
+ * publishing through this API does not spend AI build credits.
+ */
+class LovableApi(private val key: String) {
+    private val base = "https://api.lovable.dev"
+    private val json = Json { ignoreUnknownKeys = true }
+    private val jsonMedia = "application/json".toMediaType()
+    private val http = OkHttpClient.Builder()
+        .connectTimeout(15, TimeUnit.SECONDS)
+        .readTimeout(60, TimeUnit.SECONDS)
+        .build()
+
+    private suspend fun request(method: String, path: String, query: List<Pair<String, String>> = emptyList()): JsonElement =
+        withContext(Dispatchers.IO) {
+            val url = "$base$path".toHttpUrl().newBuilder().apply {
+                query.forEach { (name, value) -> addQueryParameter(name, value) }
+            }.build()
+            val request = Request.Builder()
+                .url(url)
+                .header("Lovable-API-Key", key)
+                .header("Lovable-Version", "2026-09-11")
+                .header("Accept", "application/json")
+                .method(method, if (method == "GET") null else "{}".toRequestBody(jsonMedia))
+                .build()
+            http.newCall(request).execute().use { response ->
+                val text = response.body?.string().orEmpty()
+                if (!response.isSuccessful) {
+                    val problem = runCatching { json.parseToJsonElement(text).obj() }.getOrNull()
+                    val detail = problem.s("detail") ?: problem.s("title")
+                    throw ApiException(
+                        response.code,
+                        when {
+                            response.code == 401 -> "Lovable rejected the API key"
+                            response.code == 403 -> "Lovable: ${detail ?: "this key or plan is not allowed to do that"}"
+                            !detail.isNullOrBlank() -> "Lovable: $detail"
+                            else -> "Lovable returned ${response.code}"
+                        },
+                    )
+                }
+                if (text.isBlank()) JsonNull else json.parseToJsonElement(text)
+            }
+        }
+
+    /** Projects across every workspace the key can see (first 100 per request). */
+    suspend fun projects(): List<JsonObject> {
+        val workspaces = request("GET", "/v1/workspaces").obj().a("data").mapNotNull { it.obj().s("id") }.take(10)
+        if (workspaces.isEmpty()) return emptyList()
+        val query = workspaces.map { "workspace_id" to it } + ("limit" to "100")
+        return request("GET", "/v1/projects", query).obj().a("data").mapNotNull { it.obj() }
+    }
+
+    /** Starts a publish and returns the deployment id to poll. */
+    suspend fun publish(projectId: String): String =
+        request("POST", "/v1/projects/$projectId/publish").obj().let { it.s("id") ?: it.o("data").s("id") }
+            ?: throw ApiException(0, "Lovable did not return a deployment id")
+
+    suspend fun publishStatus(projectId: String, deploymentId: String): JsonObject =
+        request("GET", "/v1/projects/$projectId/publish/$deploymentId").obj().let { it.o("data") ?: it }
+            ?: JsonObject(emptyMap())
 }

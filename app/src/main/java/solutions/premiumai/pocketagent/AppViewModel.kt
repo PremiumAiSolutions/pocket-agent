@@ -14,7 +14,7 @@ import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import kotlinx.serialization.json.JsonObject
 
-enum class Screen { Connect, Sessions, Settings, Chat, Diff }
+enum class Screen { Connect, Sessions, Projects, Settings, Chat, Diff }
 
 data class SessionItem(val id: String, val title: String, val directory: String)
 
@@ -24,6 +24,12 @@ data class ProjectItem(val name: String, val directory: String)
 data class ModelItem(val id: String, val providerId: String, val name: String, val tools: Boolean = true) {
     val label: String get() = if (tools) "$name  ($providerId)" else "$name  ($providerId, chat only)"
 }
+
+data class RepoItem(val fullName: String, val private: Boolean) {
+    val name: String get() = fullName.substringAfterLast('/')
+}
+
+data class LovableProject(val id: String, val name: String)
 
 data class ProviderItem(val id: String, val name: String, val connected: Boolean, val acceptsKey: Boolean)
 
@@ -72,6 +78,29 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
     var providers by mutableStateOf(listOf<ProviderItem>())
         private set
     var notice by mutableStateOf<String?>(null)
+
+    /** Folder the server was started in; its subfolders are the projects on the PC. */
+    var baseDir by mutableStateOf("")
+        private set
+    var folders by mutableStateOf(listOf<ProjectItem>())
+        private set
+    /** GitHub login of the account signed in on the PC, or null when not signed in. */
+    var githubUser by mutableStateOf<String?>(null)
+        private set
+    var githubChecked by mutableStateOf(false)
+        private set
+    var repos by mutableStateOf(listOf<RepoItem>())
+        private set
+    var branch by mutableStateOf<String?>(null)
+        private set
+    /** Short description of a long-running action, shown while it runs. */
+    var activity by mutableStateOf<String?>(null)
+        private set
+
+    var lovableKey by mutableStateOf(prefs.getString("lovable_key", "") ?: "")
+        private set
+    var lovableProjects by mutableStateOf(listOf<LovableProject>())
+        private set
 
     /** Model used for new sessions, chosen in Settings. Null means the server decides. */
     var defaultModel by mutableStateOf(
@@ -144,6 +173,9 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
         current = null
         messages = emptyList()
         permissions = emptyList()
+        githubChecked = false
+        githubUser = null
+        repos = emptyList()
         screen = Screen.Connect
     }
 
@@ -155,6 +187,172 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
         }
         loadModels(client)
         loadProviders(client)
+        loadFolders(client)
+    }
+
+    private fun join(parent: String, child: String): String {
+        val separator = if (parent.contains('\\')) "\\" else "/"
+        return parent.trimEnd('/', '\\') + separator + child
+    }
+
+    private suspend fun loadFolders(client: OpenCodeApi) {
+        baseDir = client.baseDirectory() ?: ""
+        val skipped = setOf("node_modules", "\$RECYCLE.BIN", "System Volume Information")
+        folders = client.folders(null)
+            .filter { !it.startsWith(".") && it !in skipped }
+            .sortedBy { it.lowercase() }
+            .map { ProjectItem(it, join(baseDir, it)) }
+    }
+
+    // ---- projects and GitHub ----------------------------------------------
+
+    fun openProjects() {
+        screen = Screen.Projects
+        run { client ->
+            loadFolders(client)
+            loadGithub(client)
+        }
+    }
+
+    fun refreshGithub() = run { loadGithub(it) }
+
+    /** GitHub access comes from the GitHub CLI signed in on the PC, so no token is kept on the phone. */
+    private suspend fun loadGithub(client: OpenCodeApi) {
+        val who = client.shell("gh api user --jq .login", baseDir.ifBlank { null }, 30)
+        githubChecked = true
+        if (!who.ok) {
+            githubUser = null
+            repos = emptyList()
+            return
+        }
+        githubUser = who.output.lines().lastOrNull { it.isNotBlank() }?.trim()
+        val listed = client.shell("gh repo list --limit 300 --json nameWithOwner,isPrivate", baseDir.ifBlank { null }, 60)
+        if (!listed.ok) return
+        val start = listed.output.indexOf('[')
+        val end = listed.output.lastIndexOf(']')
+        if (start == -1 || end <= start) return
+        repos = runCatching {
+            kotlinx.serialization.json.Json.parseToJsonElement(listed.output.substring(start, end + 1)).arr()
+        }.getOrNull().orEmpty().mapNotNull { it.obj() }.mapNotNull { repo ->
+            RepoItem(repo.s("nameWithOwner") ?: return@mapNotNull null, repo["isPrivate"].str() == "true")
+        }.sortedBy { it.fullName.lowercase() }
+    }
+
+    fun localFolder(repo: RepoItem): ProjectItem? = folders.firstOrNull { it.name.equals(repo.name, ignoreCase = true) }
+
+    /** Opens a repo, cloning it into the base folder on the PC first when it is not there yet. */
+    fun openRepo(repo: RepoItem) {
+        localFolder(repo)?.let {
+            newSession(it.directory)
+            return
+        }
+        if (activity != null) return
+        run { client ->
+            activity = "Cloning ${repo.fullName}"
+            try {
+                val result = client.shell("gh repo clone ${repo.fullName}", baseDir.ifBlank { null }, 600)
+                if (!result.ok) {
+                    error = "Clone failed: " + result.output.takeLast(300)
+                    return@run
+                }
+                loadFolders(client)
+            } finally {
+                activity = null
+            }
+            newSession(join(baseDir, repo.name))
+        }
+    }
+
+    /** Stages everything, commits with the given message and pushes the current branch. */
+    fun commitAndPush(message: String) {
+        val directory = current?.directory?.ifBlank { null } ?: return
+        if (activity != null) return
+        // Double quotes would end the quoted message early in every shell.
+        val safe = message.trim().replace('"', '\'').replace("\n", " ").replace("`", "'").replace("$", "").ifBlank { "Update from Pocket Agent" }
+        run { client ->
+            activity = "Committing and pushing"
+            try {
+                val added = client.shell("git add -A", directory, 60)
+                if (!added.ok) {
+                    error = "git add failed: " + added.output.takeLast(300)
+                    return@run
+                }
+                val committed = client.shell("git commit -m \"$safe\"", directory, 60)
+                val nothingNew = committed.output.contains("nothing to commit", ignoreCase = true)
+                if (!committed.ok && !nothingNew) {
+                    error = "Commit failed: " + committed.output.takeLast(300)
+                    return@run
+                }
+                val pushed = client.shell("git push", directory, 180)
+                if (!pushed.ok) {
+                    error = "Push failed: " + pushed.output.takeLast(300)
+                    return@run
+                }
+                notice = if (nothingNew) "Nothing new to commit. Branch pushed." else "Committed and pushed to ${branch ?: "the current branch"}"
+            } finally {
+                activity = null
+            }
+        }
+    }
+
+    // ---- Lovable ----------------------------------------------------------
+
+    fun saveLovableKey(key: String) {
+        lovableKey = key.trim()
+        prefs.edit().putString("lovable_key", lovableKey).apply()
+        lovableProjects = emptyList()
+        if (lovableKey.isNotBlank()) loadLovableProjects(announce = true)
+    }
+
+    fun loadLovableProjects(announce: Boolean = false) {
+        if (lovableKey.isBlank()) {
+            error = "Add your Lovable API key in Settings first"
+            return
+        }
+        run {
+            lovableProjects = LovableApi(lovableKey).projects().mapNotNull { project ->
+                val id = project.s("id") ?: return@mapNotNull null
+                LovableProject(id, project.s("name") ?: project.s("display_name") ?: project.s("title") ?: id)
+            }
+            if (announce) notice = "Lovable connected: ${lovableProjects.size} projects"
+        }
+    }
+
+    /** The Lovable project linked to the open session's folder, if one was chosen before. */
+    fun linkedLovableProject(): String? = current?.directory?.let { prefs.getString("lovable_project:$it", null) }
+
+    fun linkLovableProject(project: LovableProject) {
+        val directory = current?.directory ?: return
+        prefs.edit().putString("lovable_project:$directory", project.id).apply()
+    }
+
+    /** Builds and publishes the latest saved version on Lovable. Does not use AI credits. */
+    fun publishLovable(projectId: String) {
+        if (activity != null) return
+        run {
+            activity = "Publishing on Lovable"
+            try {
+                val lovable = LovableApi(lovableKey)
+                val deploymentId = lovable.publish(projectId)
+                repeat(100) {
+                    delay(3000)
+                    val status = lovable.publishStatus(projectId, deploymentId)
+                    val url = status.s("url")
+                    val failure = status.s("error_message") ?: status.s("error")
+                    if (!url.isNullOrBlank()) {
+                        notice = "Published: $url"
+                        return@run
+                    }
+                    if (!failure.isNullOrBlank() || status.s("status") == "failed") {
+                        error = "Lovable publish failed: ${failure ?: "no reason given"}"
+                        return@run
+                    }
+                }
+                error = "Lovable is still publishing. Check the project in Lovable."
+            } finally {
+                activity = null
+            }
+        }
     }
 
     private suspend fun loadModels(client: OpenCodeApi) {
@@ -184,6 +382,7 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
     fun openSettings() {
         screen = Screen.Settings
         refreshHome()
+        if (!githubChecked) refreshGithub()
     }
 
     /** Sends an API key to the server, which stores it and unlocks that provider's models. */
@@ -240,7 +439,7 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
     fun back() {
         when (screen) {
             Screen.Diff -> screen = Screen.Chat
-            Screen.Settings -> screen = Screen.Sessions
+            Screen.Settings, Screen.Projects -> screen = Screen.Sessions
             Screen.Chat -> {
                 current = null
                 screen = Screen.Sessions
@@ -278,6 +477,8 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
     fun showDiff() {
         val session = current ?: return
         screen = Screen.Diff
+        branch = null
+        run { client -> branch = client.branch(session.directory.ifBlank { null }) }
         run { client ->
             diff = client.sessionDiff(session.id).mapNotNull { it.obj() }.map { file ->
                 DiffFile(

@@ -17,6 +17,9 @@ the phone client plus setup scripts.
 - Stop a running task
 - Switch the model per session (Venice, Gemini, anything the server has configured)
 - Settings: paste API keys for Venice, Gemini or any other provider, and pick the default model
+- Project browser: every folder inside the server's start folder, plus your GitHub repos (cloned to the PC on first open)
+- Commit and push from the Changes screen
+- Publish on Lovable through the Lovable API, which does not spend AI credits (needs a Lovable API key)
 - View the file changes a session made
 
 ## Run the server on your PC
@@ -30,8 +33,11 @@ The script installs OpenCode if needed, asks for a server password, prints the a
 type into the app, and starts the server on port 4096. Windows will ask to allow it through
 the firewall the first time; allow it on private networks.
 
-The project folder should be a git repo cloned from GitHub. The agent commits and pushes with
-the git credentials already on the PC.
+Point `-Project` at the folder that holds your projects. Each subfolder shows up in the app.
+
+GitHub features use the GitHub CLI on the PC. Install it from https://cli.github.com and run
+`gh auth login` once. The app then lists your repos, clones them, and commits and pushes with
+that sign-in. No GitHub token is stored on the phone.
 
 ### Away from home
 
