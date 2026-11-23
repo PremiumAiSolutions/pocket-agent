@@ -11,9 +11,24 @@ param(
     [int]$Port = 4096
 )
 
-if (-not (Get-Command opencode -ErrorAction SilentlyContinue)) {
+# Finds the opencode command, including when npm's global folder is not on PATH.
+function Find-OpenCode {
+    $command = Get-Command opencode -ErrorAction SilentlyContinue
+    if ($command) { return $command.Source }
+    $candidate = Join-Path (npm prefix -g) "opencode.cmd"
+    if (Test-Path $candidate) { return $candidate }
+    return $null
+}
+
+$opencode = Find-OpenCode
+if (-not $opencode) {
     Write-Host "Installing OpenCode..."
     npm i -g "@opencode/cli@latest"
+    $opencode = Find-OpenCode
+}
+if (-not $opencode) {
+    Write-Host "OpenCode installed but its command could not be found. Run 'npm prefix -g' and check that folder for opencode.cmd." -ForegroundColor Red
+    exit 1
 }
 
 if (-not $env:OPENCODE_PASSWORD) {
@@ -36,4 +51,4 @@ foreach ($address in $addresses) { Write-Host "  ${address}:$Port" }
 Write-Host ""
 
 Set-Location $Project
-opencode serve --hostname 0.0.0.0 --port $Port
+& $opencode serve --hostname 0.0.0.0 --port $Port
