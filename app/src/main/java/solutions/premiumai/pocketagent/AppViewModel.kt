@@ -1,20 +1,26 @@
 package solutions.premiumai.pocketagent
 
 import android.app.Application
+import android.content.ContentValues
 import android.content.Context
+import android.os.Build
+import android.provider.MediaStore
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.setValue
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
 import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.withContext
+import java.io.File
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import kotlinx.serialization.json.JsonObject
 
-enum class Screen { Connect, Sessions, Projects, Settings, Chat, Diff }
+enum class Screen { Connect, Sessions, Projects, Media, Settings, Chat, Diff }
 
 data class SessionItem(val id: String, val title: String, val directory: String)
 
@@ -28,6 +34,17 @@ data class ModelItem(val id: String, val providerId: String, val name: String, v
 data class RepoItem(val fullName: String, val private: Boolean) {
     val name: String get() = fullName.substringAfterLast('/')
 }
+
+/** A video the user asked for, held until they accept the quoted price. */
+data class PendingVideo(
+    val model: MediaModel,
+    val prompt: String,
+    val duration: String,
+    val resolution: String?,
+    val aspect: String?,
+    val audio: Boolean,
+    val quote: Double?,
+)
 
 data class LovableProject(val id: String, val name: String)
 
@@ -295,6 +312,145 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
         }
     }
 
+    // ---- images and video -------------------------------------------------
+
+    /** Kept on the phone because image and video requests go from the phone straight to Venice. */
+    var veniceKey by mutableStateOf(prefs.getString("venice_key", "") ?: "")
+        private set
+    var imageModels by mutableStateOf(listOf<MediaModel>())
+        private set
+    var videoModels by mutableStateOf(listOf<MediaModel>())
+        private set
+    var imageModelId by mutableStateOf(prefs.getString("image_model", "") ?: "")
+        private set
+    var videoModelId by mutableStateOf(prefs.getString("video_model", "") ?: "")
+        private set
+    /** Generated files kept in the app, newest first. */
+    var media by mutableStateOf(listOf<File>())
+        private set
+    var pendingVideo by mutableStateOf<PendingVideo?>(null)
+        private set
+
+    private fun mediaDir(): File = File(getApplication<Application>().filesDir, "media").apply { mkdirs() }
+
+    private fun refreshMedia() {
+        media = mediaDir().listFiles()?.filter { it.isFile }?.sortedByDescending { it.lastModified() } ?: emptyList()
+    }
+
+    /** Runs one background job, showing label in the progress bar. Only one labelled job runs at a time. */
+    private fun task(label: String?, block: suspend () -> Unit) {
+        if (label != null && activity != null) return
+        viewModelScope.launch {
+            if (label != null) activity = label
+            try {
+                block()
+            } catch (cancelled: CancellationException) {
+                throw cancelled
+            } catch (failure: Exception) {
+                error = failure.message ?: "Something went wrong"
+            } finally {
+                if (label != null) activity = null
+            }
+        }
+    }
+
+    fun openMedia() {
+        screen = Screen.Media
+        refreshMedia()
+        if (veniceKey.isNotBlank() && imageModels.isEmpty()) loadMediaModels()
+    }
+
+    fun saveVeniceKey(key: String) {
+        veniceKey = key.trim()
+        prefs.edit().putString("venice_key", veniceKey).apply()
+        if (veniceKey.isNotBlank()) loadMediaModels()
+    }
+
+    fun loadMediaModels() = task(null) {
+        val venice = VeniceApi(veniceKey)
+        imageModels = venice.models("image")
+        // Only prompt-driven video models: the others need a source image or clip.
+        videoModels = venice.models("video").filterNot { model ->
+            listOf("image-to-video", "reference-to-video", "video-to-video").any { model.id.contains(it) }
+        }
+    }
+
+    fun chooseMediaModel(video: Boolean, model: MediaModel) {
+        if (video) videoModelId = model.id else imageModelId = model.id
+        prefs.edit().putString(if (video) "video_model" else "image_model", model.id).apply()
+    }
+
+    fun generateImage(model: MediaModel, prompt: String, negative: String, aspect: String?, resolution: String?, safeMode: Boolean) =
+        task("Generating image") {
+            val bytes = VeniceApi(veniceKey).generateImage(model, prompt.trim(), negative.trim(), aspect, resolution, safeMode)
+            withContext(Dispatchers.IO) { File(mediaDir(), "image-${System.currentTimeMillis()}.jpg").writeBytes(bytes) }
+            refreshMedia()
+        }
+
+    /** Asks Venice what the video will cost. Nothing is charged until confirmVideo. */
+    fun requestVideo(model: MediaModel, prompt: String, duration: String, resolution: String?, aspect: String?, audio: Boolean) =
+        task("Getting the price") {
+            val quote = VeniceApi(veniceKey).quoteVideo(model, duration, resolution, aspect, audio)
+            pendingVideo = PendingVideo(model, prompt.trim(), duration, resolution, aspect, audio, quote)
+        }
+
+    fun cancelVideo() {
+        pendingVideo = null
+    }
+
+    fun confirmVideo() {
+        val request = pendingVideo ?: return
+        pendingVideo = null
+        task("Generating video") {
+            val venice = VeniceApi(veniceKey)
+            val job = venice.queueVideo(
+                request.model, request.prompt, request.duration, request.resolution, request.aspect, request.audio,
+            )
+            val target = File(mediaDir(), "video-${System.currentTimeMillis()}.mp4")
+            // Up to 20 minutes, checking every 5 seconds.
+            repeat(240) { attempt ->
+                delay(5000)
+                if (venice.retrieveVideo(job, target)) {
+                    refreshMedia()
+                    notice = "Video ready"
+                    return@task
+                }
+                activity = "Generating video (${(attempt + 1) * 5}s)"
+            }
+            error = "The video is still rendering on Venice after 20 minutes. It was not downloaded."
+        }
+    }
+
+    fun deleteMedia(file: File) {
+        file.delete()
+        refreshMedia()
+    }
+
+    /** Copies a generated file into the phone's gallery (Pictures or Movies, in a PocketAgent folder). */
+    fun saveToPhone(file: File) = task(null) {
+        val isVideo = file.extension == "mp4"
+        withContext(Dispatchers.IO) {
+            val resolver = getApplication<Application>().contentResolver
+            val values = ContentValues().apply {
+                put(MediaStore.MediaColumns.DISPLAY_NAME, file.name)
+                put(MediaStore.MediaColumns.MIME_TYPE, if (isVideo) "video/mp4" else "image/jpeg")
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                    put(MediaStore.MediaColumns.RELATIVE_PATH, if (isVideo) "Movies/PocketAgent" else "Pictures/PocketAgent")
+                }
+            }
+            val collection = if (isVideo) {
+                MediaStore.Video.Media.EXTERNAL_CONTENT_URI
+            } else {
+                MediaStore.Images.Media.EXTERNAL_CONTENT_URI
+            }
+            val destination = resolver.insert(collection, values)
+                ?: throw ApiException(0, "The phone refused to create the file")
+            resolver.openOutputStream(destination)?.use { output -> file.inputStream().use { it.copyTo(output) } }
+                ?: throw ApiException(0, "The phone refused to open the file for writing")
+        }
+        notice = if (isVideo) "Saved to Movies/PocketAgent" else "Saved to Pictures/PocketAgent"
+    }
+
     // ---- Lovable ----------------------------------------------------------
 
     fun saveLovableKey(key: String) {
@@ -391,6 +547,7 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
         if (trimmed.isEmpty()) return
         run { client ->
             client.connectKey(provider.id, trimmed)
+            if (provider.id.contains("venice", ignoreCase = true)) saveVeniceKey(trimmed)
             notice = "${provider.name} key saved"
             loadProviders(client)
             // The server refreshes its model list shortly after a key is added.
@@ -439,7 +596,7 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
     fun back() {
         when (screen) {
             Screen.Diff -> screen = Screen.Chat
-            Screen.Settings, Screen.Projects -> screen = Screen.Sessions
+            Screen.Settings, Screen.Projects, Screen.Media -> screen = Screen.Sessions
             Screen.Chat -> {
                 current = null
                 screen = Screen.Sessions

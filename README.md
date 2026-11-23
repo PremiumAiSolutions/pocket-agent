@@ -19,6 +19,7 @@ the phone client plus setup scripts.
 - Settings: paste API keys for Venice, Gemini or any other provider, and pick the default model
 - Project browser: every folder inside the server's start folder, plus your GitHub repos (cloned to the PC on first open)
 - Commit and push from the Changes screen
+- Create: generate images and videos with any Venice media model, keep them in the app, save them to the phone
 - Publish on Lovable through the Lovable API, which does not spend AI credits (needs a Lovable API key)
 - View the file changes a session made
 
@@ -56,6 +57,8 @@ To build locally: open the folder in Android Studio, or run `./gradlew assembleD
 ## Notes
 
 - The server password is stored in the app's private storage on the phone.
+- The Venice key (for image and video) and the Lovable key are also stored in the app's private storage,
+  because the phone calls those services directly.
 - `app/debug.keystore` is a throwaway test key so new builds install over old ones. It is not
   a release key.
 

@@ -63,9 +63,9 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.lifecycle.viewmodel.compose.viewModel
 
-private val Accent = Color(0xFF7CC4FF)
-private val Added = Color(0xFF7BD88F)
-private val Removed = Color(0xFFFF8A80)
+internal val Accent = Color(0xFF7CC4FF)
+internal val Added = Color(0xFF7BD88F)
+internal val Removed = Color(0xFFFF8A80)
 
 private val Colors = darkColorScheme(
     primary = Accent,
@@ -131,6 +131,7 @@ private fun App(vm: AppViewModel = viewModel()) {
             Screen.Connect -> ConnectScreen(vm)
             Screen.Sessions -> SessionsScreen(vm)
             Screen.Projects -> ProjectsScreen(vm)
+            Screen.Media -> MediaScreen(vm)
             Screen.Settings -> SettingsScreen(vm)
             Screen.Chat -> ChatScreen(vm)
             Screen.Diff -> DiffScreen(vm)
@@ -141,7 +142,7 @@ private fun App(vm: AppViewModel = viewModel()) {
 }
 
 @Composable
-private fun Header(title: String, onBack: (() -> Unit)? = null, actions: @Composable () -> Unit = {}) {
+internal fun Header(title: String, onBack: (() -> Unit)? = null, actions: @Composable () -> Unit = {}) {
     Row(
         modifier = Modifier.fillMaxWidth().padding(horizontal = 8.dp, vertical = 6.dp),
         verticalAlignment = Alignment.CenterVertically,
@@ -217,6 +218,7 @@ private fun SessionsScreen(vm: AppViewModel) {
                 .background(if (vm.online) Added else Removed),
         )
         Spacer(Modifier.width(8.dp))
+        TextButton(onClick = { vm.openMedia() }) { Text("Create") }
         TextButton(onClick = { vm.openSettings() }) { Text("Settings") }
         Button(onClick = { vm.openProjects() }) { Text("New") }
     }
@@ -332,7 +334,7 @@ private fun ProjectRow(title: String, subtitle: String, trailing: String, onClic
 
 /** A simple list dialog. Each option is a label plus the value handed back when picked. */
 @Composable
-private fun PickerDialog(
+internal fun PickerDialog(
     title: String,
     options: List<Pair<String, String>>,
     onPick: (String) -> Unit,
@@ -689,7 +691,7 @@ private fun ModelPicker(title: String, models: List<ModelItem>, onPick: (ModelIt
 }
 
 @Composable
-private fun SectionTitle(text: String) {
+internal fun SectionTitle(text: String) {
     Text(
         text = text,
         style = MaterialTheme.typography.labelLarge,
